@@ -106,3 +106,71 @@ sequenceDiagram
 
 當 Agent 啟動時，Task Manager 會同時排程 HTTP/2 通訊、Queue 批次傳輸與命令處理協程；MultiType Queue 則作為資料交會點，確保模組推送的事件與命令回報在 Agent 重啟或網路不穩定時不會遺失。【F:src/agent/src/agent.cpp†L134-L196】【F:src/agent/multitype_queue/src/multitype_queue.cpp†L17-L224】
 
+
+## Communicator
+
+`communicator::Communicator` 將認證、事件上送、命令抓取與集中化設定下載的 HTTP 工作拆分成四條協程，並在 `Agent::Run` 時由 Task Manager 依固定順序排程：
+
+1. **同步登入**：`SendAuthenticationRequest` 立即以 UUID/Key 呼叫 `/api/v1/authentication`，若成功將 JWT 寫入 `m_token` 並記錄過期時間供後續協程使用。【F:src/agent/src/agent.cpp†L137-L142】【F:src/agent/communicator/src/communicator.cpp†L74-L135】
+2. **權杖續期**：`WaitForTokenExpirationAndAuthenticate` 先等到當前權杖剩餘壽命減去 2 秒 (`TOKEN_PRE_EXPIRY_SECS`) 後再觸發重新認證；若登入失敗或遇到例外，會依 `agent.retry_interval` 重試，直到成功或 Agent 停止。【F:src/agent/src/agent.cpp†L144-L146】【F:src/agent/communicator/src/communicator.cpp†L137-L210】
+3. **命令抓取**：`GetCommandsFromManager` 以 `commands_request_timeout` 參數 (預設 15 分鐘上限、10 秒下限) 呼叫 `/api/v1/commands`，取回的 JSON 透過 `PushCommandsToQueue` 轉成 COMMAND 訊息寫入 MultiType Queue。【F:src/agent/src/agent.cpp†L148-L156】【F:src/agent/communicator/src/communicator.cpp†L212-L229】【F:src/agent/src/message_queue_utils.cpp†L27-L47】
+4. **事件上送**：`StatefulMessageProcessingTask` 與 `StatelessMessageProcessingTask` 會傳入 `GetMessagesFromQueue` 協程，依 `events.batch_size` 批次取出 STATEFUL/STATELESS 訊息並分別送往 `/api/v1/events/stateful` 與 `/api/v1/events/stateless`。【F:src/agent/src/agent.cpp†L158-L180】【F:src/agent/communicator/src/communicator.cpp†L231-L276】【F:src/agent/src/message_queue_utils.cpp†L7-L25】
+
+上述三個長駐協程都共用 `ExecuteRequestLoop`，流程如下：
+
+```mermaid
+sequenceDiagram
+    participant Task as TaskManager
+    participant Comm as Communicator
+    participant Queue as MultiType Queue
+    participant HTTP as IHttpClient
+    participant Manager as Wazuh Manager
+
+    Task->>Comm: ExecuteRequestLoop(params, messageGetter, onSuccess)
+    loop while keepRunning
+        alt 未取得權杖
+            Comm->>Comm: WaitForTimer(1s)
+        else 有批次函式
+            Comm->>Queue: getNextBytesAwaitable(batchSize)
+            Queue-->>Comm: (count, payload)
+        end
+        Comm->>HTTP: Co_PerformHttpRequest(params)
+        HTTP-->>Comm: (status, body)
+        alt 2xx 成功
+            Comm->>Comm: onSuccess(count, body)
+        else 401/403
+            Comm->>Comm: TryReAuthenticate()
+        else 其他失敗
+            Comm->>Comm: Wait retry_interval
+        end
+    end
+```
+
+### 設定來源與逾時
+
+| 項目 | 設定鍵 | 預設值/範圍 | 用途 |
+| --- | --- | --- | --- |
+| Server URL | `agent.server_url` | `config::agent::DEFAULT_SERVER_URL` | 所有 REST 呼叫的 base URL。【F:src/agent/communicator/src/communicator.cpp†L49-L67】 |
+| Retry Interval | `agent.retry_interval` | `config::agent::DEFAULT_RETRY_INTERVAL` (毫秒) | 認證失敗與事件/命令錯誤的回復延遲。【F:src/agent/communicator/src/communicator.cpp†L69-L73】【F:src/agent/communicator/src/communicator.cpp†L302-L320】 |
+| Batch Size | `events.batch_size` | 1,000–100,000,000 bytes | `GetMessagesFromQueue` 批次閾值，控制每次上傳的 payload 大小。【F:src/agent/communicator/src/communicator.cpp†L75-L86】【F:src/agent/src/message_queue_utils.cpp†L7-L25】 |
+| Command Timeout | `agent.commands_request_timeout` | 10 秒–15 分鐘 (毫秒) | `/api/v1/commands` 請求的 HTTP 逾時參數。【F:src/agent/communicator/src/communicator.cpp†L88-L106】【F:src/agent/communicator/src/communicator.cpp†L212-L229】 |
+| Verification Mode | `agent.verification_mode` | 見 `config::agent::VALID_VERIFICATION_MODES` | 決定 TLS 憑證驗證策略。【F:src/agent/communicator/src/communicator.cpp†L88-L101】 |
+
+### 回呼與資料管線
+
+- **命令入佇列**：成功回應後呼叫 `PushCommandsToQueue`，後者解析 JSON 並將每筆命令轉成 COMMAND 類型訊息推入 MultiType Queue，供 Command Handler 後續處理。【F:src/agent/src/agent.cpp†L148-L156】【F:src/agent/src/message_queue_utils.cpp†L27-L47】
+- **事件清除**：事件上送成功時以 `PopMessagesFromQueue` 依回報的筆數自 Queue 刪除資料，避免重複送出。【F:src/agent/src/agent.cpp†L158-L180】【F:src/agent/src/message_queue_utils.cpp†L23-L26】
+- **集中化設定下載**：`GetGroupConfigurationFromManager` 以帶權杖的 GET `/api/v1/files?file_name=<group>.yml` 取得共享檔案，成功後寫入指定路徑；若收到 401/403 會觸發 `TryReAuthenticate` 以便權杖更新。此協程由 `CentralizedConfiguration::ExecuteCommand` 呼叫，在命令執行流程中與 Communicator 解耦。【F:src/agent/communicator/src/communicator.cpp†L278-L319】【F:src/agent/src/agent.cpp†L57-L86】【F:src/agent/centralized_configuration/include/centralized_configuration.hpp†L17-L54】
+
+### 重試與錯誤處理
+
+- **認證失敗**：登入失敗時記錄警告並等待 `retry_interval` 後重試；解析 JWT 失敗會清空權杖並立即進入重試循環。【F:src/agent/communicator/src/communicator.cpp†L108-L135】
+- **HTTP 回應**：`ExecuteRequestLoop` 對於非逾時的失敗 (例如 5xx) 會按 `retry_interval` 休眠後重試；收到 401/403 則取消權杖定時器，讓認證協程提前刷新憑證。【F:src/agent/communicator/src/communicator.cpp†L302-L320】
+- **權杖輪詢**：若 `m_token` 為空，所有傳輸協程都會每秒輪詢一次等待認證完成，避免在沒有權杖時打 API。【F:src/agent/communicator/src/communicator.cpp†L286-L304】
+
+### 重構建議與可抽換介面
+
+- **HTTP Client 抽象**：目前直接依賴 `http_client::IHttpClient`，仍與具體設定 (驗證模式、逾時) 緊耦合；可引入策略介面封裝重試與逾時，方便替換實作 (REST/gRPC)。【F:src/agent/communicator/src/communicator.cpp†L40-L107】【F:src/agent/communicator/src/communicator.cpp†L231-L320】
+- **Token 儲存與刷新**：權杖與到期時間以共享字串與原始型別存放，並由 Communicator 直接控制；建議抽出 TokenProvider 介面，提供快取、持久化或多租戶的替代方案。【F:src/agent/communicator/src/communicator.cpp†L52-L135】【F:src/agent/communicator/src/communicator.cpp†L137-L210】
+- **設定解析耦合**：Communicator 直接查詢 `ConfigurationParser` 取出設定，未提供覆寫入口；可將設定依賴改為 `CommunicatorConfig` 結構，以便測試或動態調整批次參數。【F:src/agent/communicator/src/communicator.cpp†L49-L107】
+

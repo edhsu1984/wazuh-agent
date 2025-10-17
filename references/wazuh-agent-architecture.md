@@ -74,5 +74,6 @@ graph TD
 ## 延伸閱讀
 
 - [核心元件實作筆記](agent-core-core-components.md)
+- [Communicator 協程與重試流程](agent-core-core-components.md#communicator)
 - [功能模組與命令互動](functional-modules-collectors-executors.md)
 - [支援服務模組細節](support-services-module.md)
