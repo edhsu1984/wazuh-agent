@@ -71,6 +71,31 @@ graph TD
 - Collectors 透過 `m_pushMessage` 共享函式將事件寫入 MultiType Queue，Executors 在命令完成後亦將結果寫回 Queue 供 HTTP/2 Client 傳送。【F:src/modules/logcollector/src/logcollector.cpp†L135-L163】【F:src/modules/inventory/src/inventory.cpp†L110-L153】【F:src/modules/active_response/src/execd.c†L415-L498】
 - 集中化組態變更時，`Agent::ReloadModules` 會重新載入 YAML 並熱重啟目標模組，確保新設定立即生效。【F:src/agent/src/agent.cpp†L93-L126】
 
+## Instance Communicator / Local Control
+
+- **IPC 通道與編碼**：`AgentRunner::SendSignal` 會根據組態內的 `path.run` 參數建立 `"<run path>/agent-socket"` Unix Domain Socket，訊息以純文字傳送並以換行字元結尾，配合 `InstanceCommunicator::Listen` 中的 `read` 例程使用 `\n` 作為訊息邊界。【F:src/agent/src/agent_runner_unix.cpp†L18-L43】【F:src/agent/instance_communicator/src/instance_communicator.cpp†L51-L88】
+- **訊息格式與處理**：Instance Communicator 接收到 `RELOAD` 時會要求 `Agent::ReloadModules(std::nullopt)` 重載全部模組；若訊息為 `RELOAD-MODULE:<name>` 則解析出模組名稱並只重啟對應模組，其他未知訊息會記錄警告。【F:src/agent/instance_communicator/src/instance_communicator.cpp†L35-L46】【F:src/agent/src/agent.cpp†L93-L126】
+- **錯誤處理與輪詢**：`Listen` 在失敗時記錄錯誤、關閉監聽器，並透過 1 秒的 `steady_timer` 等待後再次嘗試開啟，確保本地 CLI 短暫連線失敗時能自動恢復。【F:src/agent/instance_communicator/src/instance_communicator.cpp†L55-L118】
+- **CLI 回饋**：CLI 的 `AgentRunner::ReloadModules` 若未提供模組名稱或 IPC 連線失敗會即時在終端印出錯誤並回傳非零值；`SendSignal` 將連線與寫入錯誤轉化為使用者可讀訊息，成功時則提示已送出重載指令。【F:src/agent/src/agent_runner.cpp†L216-L258】【F:src/agent/src/agent_runner_unix.cpp†L18-L43】
+- **模組管理互動**：Reload 流程由 Instance Communicator 把訊號轉交給 Agent，`Agent::ReloadModules` 會鎖定重載流程、重新讀取設定檔並呼叫 `ModuleManager` 進行全域或單一模組的重啟作業；例外會被捕捉並記錄錯誤訊息。【F:src/agent/src/agent.cpp†L93-L126】
+- **Restart Handler**：Command Handler 收到 `restart-handler` 模組命令時會呼叫 `RestartHandler::RestartAgent`，該函式會先判斷是否以服務形式執行，再根據平台呼叫 `systemctl` 或透過 `fork/execve` 重啟；執行結果以 `CommandExecutionResult` 回報，錯誤時會記錄日誌與傳回 `FAILURE` 狀態。【F:src/agent/src/agent.cpp†L168-L199】【F:src/agent/restart_handler/src/restart_handler.cpp†L1-L18】【F:src/agent/restart_handler/src/restart_handler_lin.cpp†L1-L20】【F:src/agent/restart_handler/src/restart_handler_unix.cpp†L1-L47】
+- **IPC 抽象化建議**：若要支援多種 IPC 實作，可維持 `IInstanceCommunicator` 與 `IListenerWrapper` 做為核心介面，並新增「訊息序列化器」與「通道工廠」抽象層，讓 Unix Socket、命名管線或 gRPC 等後端能以相同生命週期管理進行替換；錯誤回報則統一以 `boost::system::error_code` 及例外整合到日誌訊息，並由 `CommandExecutionResult`/CLI 文字回覆給使用者，避免在核心流程中吞噬錯誤。【F:src/agent/instance_communicator/include/iinstance_communicator.hpp†L9-L29】【F:src/agent/instance_communicator/include/ilistener_wrapper.hpp†L9-L35】【F:src/agent/src/agent_runner_unix.cpp†L18-L43】【F:src/agent/restart_handler/src/restart_handler_lin.cpp†L1-L20】【F:src/agent/restart_handler/src/restart_handler_unix.cpp†L1-L47】
+
+```mermaid
+flowchart TD
+    CLI[Wazuh Agent CLI\nAgentRunner::SendSignal]
+    IPC[Unix socket\n<run path>/agent-socket]
+    IC[InstanceCommunicator::Listen]
+    Agent[Agent::ReloadModules]
+    MM[ModuleManager]
+
+    CLI -->|RELOAD\nRELOAD-MODULE:<name>| IPC
+    IPC --> IC
+    IC -->|HandleSignal| Agent
+    Agent -->|Reload 全部/單一模組| MM
+    Agent -->|錯誤日誌| MM
+```
+
 ## 延伸閱讀
 
 - [核心元件實作筆記](agent-core-core-components.md)
