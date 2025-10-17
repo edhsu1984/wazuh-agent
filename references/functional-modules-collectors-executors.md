@@ -1,114 +1,57 @@
-# 功能模組（Collectors / Executors）深度解析
+# 功能模組（Collectors / Executors）指南
 
-## 模組協調架構與共通流程
+Wazuh Agent 的功能模組由 Module Manager 管理，於啟動時註冊、套用設定並透過 Task Manager 以非同步方式運行。Collectors 專注於資料蒐集，Executors 則處理由 Manager 下達的主動命令或長期任務。【F:src/modules/src/moduleManager.cpp†L39-L172】
 
-Wazuh Agent 的模組由 `ModuleManager` 在啟動期間註冊與管理，統一注入訊息推播函式與設定解析器。每個模組啟動時會由 Task Manager 排入執行緒，並在 `Setup` 中套用 YAML 設定後以 `Run` 進入主要工作迴圈；停止時則透過 `Stop` 回收資源。【F:src/modules/src/moduleManager.cpp†L21-L172】
+## 模組總覽
 
-Collectors 與 Executors 共用的資料管線如下：
+Module Manager 在 `AddModules` 階段依平台條件建立模組實例，呼叫 `Setup` 套用 Configuration Parser 中的設定，並在 `Start` 時把 `Run` 任務排入 Task Manager 的執行緒池。【F:src/modules/src/moduleManager.cpp†L39-L151】Collectors 透過 `m_pushMessage` 將事件寫入 MultiType Queue；Executors 則回寫命令結果，供 HTTP/2 Client 批次上傳。【F:src/modules/logcollector/src/logcollector.cpp†L135-L163】【F:src/modules/inventory/src/inventory.cpp†L110-L153】【F:src/modules/active_response/src/execd.c†L415-L498】
 
-```mermaid
-graph LR
-    subgraph Configuration
-        cfg[Configuration Parser]
-    end
-    subgraph Lifecycle
-        mm[ModuleManager]
-        tm[Task Manager]
-    end
-    subgraph Collectors
-        logc[Logcollector]
-        fim[FIM]
-        inv[Inventory]
-        sca[SCA]
-    end
-    subgraph Executors
-        ar[Active Response]
-        upgrade[Agent Upgrade]
-    end
-    queue[(MultiType Queue)]
-    cmd[Command Handler]
-    client[HTTP/2 Client]
-    manager[Wazuh Manager]
+### Collectors
 
-    cfg --> mm
-    mm --> tm
-    tm --> logc
-    tm --> fim
-    tm --> inv
-    tm --> sca
-    logc --> queue
-    fim --> queue
-    inv --> queue
-    sca --> queue
-    manager --> client
-    client --> cmd
-    cmd --> ar
-    cmd --> upgrade
-    ar --> queue
-    upgrade --> queue
-    queue --> client
-```
+| 模組 | 主要責任 | 設定重點 / 實作亮點 |
+| --- | --- | --- |
+| Logcollector | 依設定建立多個讀取器，透過協程讀檔並推送 stateless 訊息 | `Setup` 解析啟用旗標、輪詢間隔與來源；每個 reader 透過 `PushMessage` 將事件序列化後進入 Queue。【F:src/modules/logcollector/src/logcollector.cpp†L24-L163】 |
+| File Integrity Monitoring (FIM) | 監控檔案變更並回傳差異，支援排程與 inotify 實時模式 | `main` 載入設定、初始化 rootcheck 與 MQ；`realtime_start` 建立 inotify watcher，若資源不足會回退排程模式。【F:src/modules/fim/src/main.c†L56-L199】【F:src/modules/fim/src/run_realtime.c†L36-L143】 |
+| Inventory | 收集硬體、系統、網路等資產資訊，產生 stateful/stateless 差異訊息 | `Setup` 讀取資料庫與掃描選項；`Run` 建立 `SysInfo` 並註冊差異回呼，`PushMessage` 將刪除與新增結果分流推送。【F:src/modules/inventory/src/inventory.cpp†L9-L153】 |
+| Security Configuration Assessment (SCA) | 解析政策、排程掃描並回報檢查結果 | 建構子建立 SQLite 儲存；`Setup` 載入政策並使用 Task Manager 排程掃描，事件由 `SCAEventHandler` 回寫 Queue。【F:src/modules/sca/src/sca.cpp†L35-L116】 |
 
-## Collectors 模組
+### Executors
 
-### Logcollector
+| 模組 | 主要責任 | 設定重點 / 實作亮點 |
+| --- | --- | --- |
+| Active Response (Execd) | 接收命令、執行對應腳本並處理逾時與重複限制 | `main` 解析參數後啟動訊號處理與 MQ 連線；`ExecdStart` 使用 `select` 監聽命令佇列並根據配置派發或取消命令。【F:src/modules/active_response/src/main.c†L44-L176】【F:src/modules/active_response/src/execd.c†L360-L498】 |
+| Agent Upgrade | 監聽本地 Unix Socket 接收升級指令，並將結果回報 Manager | `wm_agent_upgrade_listen_messages` 處理外部命令並回覆；`wm_agent_upgrade_check_status` 監控結果檔案、以退避策略重送任務訊息。【F:src/modules/upgrade/src/wm_agent_upgrade_agent.c†L93-L224】 |
 
-- **啟動與任務調度**：進入 `Run` 時若模組啟用即呼叫 `TaskManager::RunSingleThread`，並以協程包裝讀取工作，配合活躍 reader 計數器確保關閉時能安全等待。【F:src/modules/logcollector/src/logcollector.cpp†L24-L104】
-- **設定與資料來源載入**：`Setup` 會讀取 `logcollector` 區段的啟用旗標、檔案輪詢間隔與來源列表，為每個來源建立 `FileReader` 並掛上排程與延遲等待函式，必要時加入平台特定 reader。【F:src/modules/logcollector/src/logcollector.cpp†L56-L96】
-- **訊息推播**：`PushMessage` 會將來源路徑、原始事件與產生時間打包成 JSON，依 Collector 類型決定 metadata 後透過 MultiType Queue 推送，供 HTTP Client 後送至 Manager。【F:src/modules/logcollector/src/logcollector.cpp†L135-L163】
+## 任務與命令流程
 
-### File Integrity Monitoring（FIM）
-
-- **守護行程初始化**：`main` 讀取參數後設定權限、載入組態並啟動 Rootcheck、訊號處理與 MQ 連線，列出所有監控目錄與設定摘要，確保排程前環境完整。【F:src/modules/fim/src/main.c†L44-L258】
-- **即時監控與排程**：`realtime_start` 與 `fim_add_inotify_watch` 會建立 inotify 監視器並記錄對應目錄，若資源不足則回退至排程模式。【F:src/modules/fim/src/run_realtime.c†L36-L143】
-- **事件發布**：FIM 執行期間透過 MQ 將檔案變更結果與 Diff 傳回核心 Queue，由 Agent 後續上傳，並在模組關閉時釋放所有 watch 與資源。【F:src/modules/fim/src/main.c†L193-L258】【F:src/modules/fim/src/run_realtime.c†L145-L197】
-
-### Inventory
-
-- **啟動流程**：`Run` 檢查模組是否啟用，建立 `SysInfo` 抽象並呼叫 `Init` 啟動資產掃描，記錄資料庫路徑與正規化設定。【F:src/modules/inventory/src/inventory.cpp†L9-L43】
-- **設定載入**：`Setup` 讀取多種掃描旗標（硬體、系統、網路、套件等），並設定資料庫與正規化檔案位置，支援定期輪詢與啟動時掃描。【F:src/modules/inventory/src/inventory.cpp†L46-L74】
-- **事件分派**：`PushMessage` 會根據差異結果產生 Stateful 與 Stateless 訊息，若包含刪除事件則以空物件回傳狀態，並將額外 stateless 清單分開推送以減少資料冗餘。【F:src/modules/inventory/src/inventory.cpp†L110-L153】
-
-### Security Configuration Assessment（SCA）
-
-- **資料庫與依賴初始化**：建構子建立 SQLite 資料庫與檔案系統封裝，確保政策與檢查結果持久化存放。【F:src/modules/sca/src/sca.cpp†L12-L53】
-- **設定應用與政策載入**：`Setup` 讀取啟用旗標、掃描間隔與是否開機掃描，並透過 `SCAPolicyLoader` 解析規範，同步差異至 Manager。【F:src/modules/sca/src/sca.cpp†L66-L107】
-- **排程執行**：每個政策的 `Run` 都會被包成協程任務，遇到掃描結果時由 `SCAEventHandler` 回寫 Queue，Task Manager 則管理定時器與停止流程。【F:src/modules/sca/src/sca.cpp†L86-L116】
-
-## Executors 模組
-
-### Active Response（Execd）
-
-- **守護行程啟動**：`main` 解析參數、檢查權限後讀入 `execd` 設定，建立訊號處理、命令通訊執行緒與 MQ 連線，最後進入 `ExecdStart` 迴圈等待指令。【F:src/modules/active_response/src/main.c†L44-L175】
-- **指令排程與逾時處理**：`ExecdStart` 使用 `select` 監聽執行隊列，並透過 `ExecdTimeoutRun` 管理延遲執行的命令；每當收到 JSON 命令即交給 `ExecdRun` 驗證與啟動對應腳本。【F:src/modules/active_response/src/execd.c†L415-L498】
-- **命令查表**：`ReadExecConfig` 與 `GetCommandbyName` 解析共享組態，過濾目錄遍歷風險並提供逾時計時值，確保只有授權腳本能被執行。【F:src/modules/active_response/src/exec.c†L26-L190】
-
-### Agent Upgrade
-
-- **命令通道**：模組啟動時建立 Unix Domain Socket，持續接收升級請求並交由 `wm_agent_upgrade_process_command` 回應，確保外部工具可觸發升級行為。【F:src/modules/upgrade/src/wm_agent_upgrade_agent.c†L93-L189】
-- **狀態回報與重試**：`wm_agent_upgrade_check_status` 會連線 MQ、輪詢 `upgrade_result` 檔案並依等待間隔逐步回報結果；`wm_upgrade_agent_send_ack_message` 將狀態包成任務訊息送往 Manager，失敗時會重建 MQ 連線再試，保障回傳可靠性。【F:src/modules/upgrade/src/wm_agent_upgrade_agent.c†L193-L286】
-
-## Collectors 與 Executors 的互動流程
-
-以下序列圖說明 Manager 指令與模組間的往返：
+1. **設定套用**：Module Manager 在 `Setup` 中傳入 Configuration Parser，模組據此讀取啟用旗標、間隔與檔案路徑等參數。【F:src/modules/src/moduleManager.cpp†L153-L160】【F:src/modules/logcollector/src/logcollector.cpp†L56-L96】【F:src/modules/inventory/src/inventory.cpp†L46-L74】
+2. **資料產生**：Collectors 在 `Run` 或排程的協程中取得資料後，透過共享的 `PushMessage` 函式推入 MultiType Queue。【F:src/modules/logcollector/src/logcollector.cpp†L24-L169】【F:src/modules/sca/src/sca.cpp†L95-L116】
+3. **命令執行**：Command Handler 取出 COMMAND 類訊息並呼叫對應模組的 `ExecuteCommand` 或系統處理程序，完成後將結果重新推入 Queue。【F:src/agent/command_handler/src/command_handler.cpp†L121-L141】【F:src/agent/src/agent.cpp†L171-L197】
+4. **批次上送**：HTTP/2 Client 依 `Agent::Run` 安排的任務從 Queue 取出 stateful/stateless 事件與命令回報，批次傳送給 Manager。【F:src/agent/src/agent.cpp†L147-L169】
 
 ```mermaid
 sequenceDiagram
-    participant Manager as Wazuh Manager
+    participant Manager
     participant Client as HTTP/2 Client
+    participant Queue as MultiType Queue
     participant Cmd as Command Handler
-    participant Modules as ModuleManager
     participant Col as Collectors
     participant Exe as Executors
-    participant Queue as MultiType Queue
 
-    Manager->>Client: 下發模組指令 / 組態更新
-    Client->>Cmd: 傳遞命令與參數
-    Cmd->>Modules: 觸發對應模組 ExecuteCommand
-    Exe->>Queue: 回寫處理結果
-    Col->>Queue: 推送事件與狀態
-    Queue->>Client: 提供批次資料
-    Client->>Manager: 上傳事件、命令回覆
+    Col->>Queue: push STATELESS / STATEFUL
+    Manager->>Client: 下發命令
+    Client->>Queue: push COMMAND
+    Cmd->>Queue: getNext COMMAND
+    Cmd->>Exe: ExecuteCommand
+    Exe-->>Cmd: Result
+    Cmd->>Queue: push 結果
+    Queue->>Client: getNext 批次
+    Client->>Manager: 上傳事件與命令結果
 ```
 
-透過上述架構，Collectors 專注於資料蒐集與狀態同步，Executors 則負責執行 Manager 下達的主動操作，兩者皆依賴共同的 Queue 與 Command Handler 與核心模組協作，確保代理端既能回報安全事件也能響應集中化控制。【F:references/wazuh-agent-architecture.md†L8-L47】【F:src/modules/src/moduleManager.cpp†L39-L172】
+## 開發提示
+
+- **新增模組**：建立 `IModule` 實作後於 Module Manager 註冊，並確保 `Setup` 支援 Configuration Parser 預設值，以便集中化組態熱更新。【F:src/modules/src/moduleManager.cpp†L39-L104】
+- **命令支援**：若模組需要遠端命令，實作 `ExecuteCommand` 並於 Command Handler 的命令對映表中註冊參數驗證邏輯。【F:src/modules/logcollector/src/logcollector.cpp†L105-L123】【F:src/agent/command_handler/src/command_handler.cpp†L20-L200】
+- **Queue 效能**：長時間任務應善用 Task Manager 的協程或定時器，避免阻塞 Queue 的批次機制。【F:src/modules/sca/src/sca.cpp†L86-L116】【F:src/agent/task_manager/src/task_manager.cpp†L117-L148】
+
