@@ -1,10 +1,12 @@
 # Wazuh Agent 架構與元件分析
 
+> 延伸閱讀：若需 HTTP/2 Client、MultiType Queue 與 Command Handler 的詳細工作流程與程式碼位置，請參考《[Wazuh Agent 核心元件深度解析](agent-core-core-components.md)》。
+
 ## 核心元件概覽
 
 Wazuh Agent 透過清楚分工的元件協作，達成安全事件的蒐集、緩衝與傳送。其核心元件如下：
 
-- **Agent 核心**：包含 HTTP/2 Client、Queue 及 Command Handler。Client 與 Wazuh Manager 建立安全雙向連線；Queue 以 SQLite 為後端保存事件與指令；Command Handler 則負責執行從 Manager 下發的命令並寫回結果。【F:docs/ref/introduction/architecture.md†L5-L44】
+- **Agent 核心**：包含 HTTP/2 Client、Queue 及 Command Handler。Client 透過 Boost.Asio 建立 HTTP/2 連線並處理認證與逾時；Queue 以 SQLite 保存事件與命令；Command Handler 負責驗證與執行命令並回寫結果。【F:docs/ref/introduction/architecture.md†L5-L44】【F:src/agent/http_client/src/http_client.cpp†L103-L180】【F:src/agent/multitype_queue/src/multitype_queue.cpp†L53-L224】【F:src/agent/command_handler/src/command_handler.cpp†L67-L170】
 - **Configuration Parser**：自 YAML 檔案或字串載入設定，提供其他模組查詢配置的能力。【F:docs/ref/introduction/architecture.md†L5-L32】
 - **Task Manager**：建立與管理執行緒，安排模組化工作的排程與生命週期。【F:docs/ref/introduction/architecture.md†L5-L32】
 - **Modules**：分為 Collectors 與 Executors。Collectors 進行日誌、檔案完整性、資安基線與資產清查等資料蒐集；Executors 處理升級、集中化配置與主動回應等操作。【F:docs/ref/introduction/architecture.md†L33-L44】
@@ -51,7 +53,7 @@ graph TD
 
 1. **設定載入與排程啟動**：Agent 啟動時，Configuration Parser 讀取 YAML 設定；Task Manager 依設定啟動對應的模組執行緒並安排排程工作。【F:docs/ref/introduction/architecture.md†L17-L32】
 2. **資料蒐集**：Collectors（例如 Logcollector、FIM、SCA 與 Inventory）依排程或事件觸發蒐集資訊，並透過 Queue 推送事件資料。【F:docs/ref/introduction/architecture.md†L33-L44】
-3. **命令執行與回饋**：Wazuh Manager 可下發指令，由 Client 取回並交給 Command Handler 執行；結果再放回 Queue 等待傳送。Executors 亦在此階段處理升級、主動回應等操作。【F:docs/ref/introduction/architecture.md†L5-L44】
+3. **命令執行與回饋**：Wazuh Manager 可下發指令，由 Client 取回並交給 Command Handler 執行；Command Handler 驗證命令、寫入命令資料庫並觸發對應模組，執行結果再透過 Queue 回送。Executors 亦在此階段處理升級、主動回應等操作。【F:docs/ref/introduction/architecture.md†L5-L44】【F:src/agent/command_handler/src/command_handler.cpp†L67-L141】
 4. **事件傳送**：Client 從 Queue 取出事件與命令結果，透過 HTTP/2 與 Manager 交換資料，Queue 以 SQLite 確保傳送前後的資料一致與持久化。【F:docs/ref/introduction/architecture.md†L5-L44】
 
 ```mermaid
