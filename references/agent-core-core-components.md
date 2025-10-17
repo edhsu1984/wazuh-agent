@@ -8,6 +8,33 @@
 - **持久化佇列**：MultiType Queue 透過 SQLite 儲存 STATELESS、STATEFUL 與 COMMAND 三類訊息，為重新啟動與批次傳輸提供緩衝。【F:src/agent/multitype_queue/include/multitype_queue.hpp†L25-L123】【F:src/agent/multitype_queue/src/multitype_queue.cpp†L17-L224】
 - **命令協調**：Command Handler 驗證命令格式、維護執行狀態並呼叫相對應的模組或系統處理程序。【F:src/agent/command_handler/src/command_handler.cpp†L37-L142】
 
+## Agent Identity / Enrollment
+
+### 持久化與預設值
+
+- 身分資訊持久化在 `path.data/agent_info.db`，包含 `agent_info`（儲存名稱、key、UUID）與 `agent_group`（儲存群組列表）兩張資料表；若資料庫不存在或為空，建構時會自動建立表格並插入空白預設列，確保後續更新可以成功。【F:src/agent/agent_info/src/agent_info_persistence.cpp†L13-L121】
+- Agent 在正常啟動（非 enrollment）時會先從上述資料庫載入名稱、key、UUID 與群組；若讀到的 UUID 為空字串，會立即隨機產生新的 UUID，以免未設定資料阻礙後續通訊。【F:src/agent/agent_info/src/agent_info.cpp†L28-L38】
+- `SetName()` 在 CLI 未傳入名稱時會回退到作業系統回報的 hostname，若無法取得則使用 `"Unknown"`，確保 `name` 欄位永遠有值；`SetKey()` 若未提供 key 則生成 32 字元隨機英數字，否則會驗證輸入是否符合長度與字元限制。【F:src/agent/agent_info/src/agent_info.cpp†L75-L140】
+- Enrollment 成功後會呼叫 `AgentInfo::Save()`：先清空資料庫、再重新寫入最新的名稱、key、UUID 與群組，避免殘留舊資料。【F:src/agent/agent_info/src/agent_info.cpp†L185-L191】
+
+### Metadata 載荷
+
+- `GetMetadataInfo()` 在 enrollment 期間產生扁平 JSON，直接輸出 `id`、`name`、`type`、`version`、`host` 與 `key`；正常運行時則包在 `{"agent": {...}}` 之下並改為附帶 `groups`，供事件上傳前附加在批次內容的開頭。【F:src/agent/agent_info/src/agent_info.cpp†L158-L182】
+- Enrollment CLI 呼叫會將上述 JSON 作為 `/agents` POST 本文提交給 Manager，回應 201 後立即持久化；若後續 `Stateful/Stateless` 批次上傳或命令執行任務需要併入 metadata，則由 `message_queue_utils::GetMessagesFromQueue()` 將 metadata 字串放在批次訊息最前面。【F:src/agent/src/agent_enrollment.cpp†L49-L77】【F:src/agent/src/message_queue_utils.cpp†L6-L27】
+- Communicator 在建立 HTTP 請求時會注入 `getMetadataInfo` 回呼給 `Stateful/Stateless` 上傳協程，確保每批事件都帶著最新的 UUID、名稱與群組資訊。【F:src/agent/src/agent.cpp†L147-L169】
+
+### CLI / 指令變更群組流程
+
+1. 管理介面或 CLI 觸發 `set-group` 指令後，Command Handler 會將其分派到 Centralized Configuration 執行器，由後者解析完整的群組列表。【F:src/agent/src/agent.cpp†L174-L197】【F:src/agent/centralized_configuration/src/centralized_configuration.cpp†L41-L83】
+2. 執行器呼叫注入的 `setGroupIdFunction`，實際上是 `AgentInfo::SetGroups()` + `SaveGroups()`，以交易方式覆寫 `agent_group` 資料表並確保寫入成功才繼續後續步驟。【F:src/agent/src/agent.cpp†L55-L60】【F:src/agent/agent_info/src/agent_info.cpp†L116-L197】【F:src/agent/agent_info/src/agent_info_persistence.cpp†L229-L258】
+3. 群組更新後會清除本機 shared config 目錄、重新下載各群組的 shared 檔案並驗證，再觸發模組重新載入，使新的群組設定立即生效。【F:src/agent/centralized_configuration/src/centralized_configuration.cpp†L65-L205】
+
+### Enrollment 重構需維持的契約
+
+- **Key 驗證**：CLI 或 API 傳入的 enrollment key 必須維持 32 字元英數字驗證，否則 enrollment 應立即失敗，以符合現有 `SetKey()` 的行為。【F:src/agent/agent_info/src/agent_info.cpp†L93-L140】【F:src/agent/src/agent_enrollment.cpp†L38-L46】
+- **UUID 生命週期**：即便資料庫缺值也要即時補發 UUID，並確保 Communicator 在建構時取得的 UUID 不為空，否則會觸發「尚未 enrollment」例外；重構時需保留這項安全檢查。【F:src/agent/agent_info/src/agent_info.cpp†L28-L38】【F:src/agent/src/agent.cpp†L21-L78】
+- **群組同步時機**：`set-group` 指令須在成功持久化後才下載 shared config 與 reload 模組；如改動流程，仍需保證群組資料庫與配置檔案一致，避免發生群組落差。【F:src/agent/centralized_configuration/src/centralized_configuration.cpp†L41-L205】
+
 ## 元件摘要
 
 | 元件 | 角色 | 重要資料結構 |
