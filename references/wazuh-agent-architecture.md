@@ -51,10 +51,26 @@ graph TD
 
 ## 工作流程說明
 
-1. **設定載入與排程啟動**：Agent 啟動時，Configuration Parser 讀取 YAML 設定；Task Manager 依設定啟動對應的模組執行緒並安排排程工作。【F:docs/ref/introduction/architecture.md†L17-L32】
+1. **設定載入與排程啟動**：Agent 啟動時，Configuration Parser 讀取 YAML 設定；Task Manager 依設定啟動對應的模組執行緒並安排排程工作。【F:docs/ref/introduction/architecture.md†L17-L32】【F:src/agent/configuration_parser/src/configuration_parser.cpp†L20-L63】【F:src/agent/task_manager/src/task_manager.cpp†L16-L65】
 2. **資料蒐集**：Collectors（例如 Logcollector、FIM、SCA 與 Inventory）依排程或事件觸發蒐集資訊，並透過 Queue 推送事件資料。【F:docs/ref/introduction/architecture.md†L33-L44】
 3. **命令執行與回饋**：Wazuh Manager 可下發指令，由 Client 取回並交給 Command Handler 執行；Command Handler 驗證命令、寫入命令資料庫並觸發對應模組，執行結果再透過 Queue 回送。Executors 亦在此階段處理升級、主動回應等操作。【F:docs/ref/introduction/architecture.md†L5-L44】【F:src/agent/command_handler/src/command_handler.cpp†L67-L141】
 4. **事件傳送**：Client 從 Queue 取出事件與命令結果，透過 HTTP/2 與 Manager 交換資料，Queue 以 SQLite 確保傳送前後的資料一致與持久化。【F:docs/ref/introduction/architecture.md†L5-L44】
+
+## 支援服務模組詳解
+
+> 延伸閱讀：更多互動流程與 mermaid 圖示請見《[支援服務模組深度解析](support-services-module.md)》。
+
+### Configuration Parser
+
+- 建構時會先載入本地 `wazuh-agent.yml`，若檔案無效則回退為空節點並留下警告，確保代理啟動不被錯誤組態阻斷。【F:src/agent/configuration_parser/src/configuration_parser.cpp†L20-L63】
+- 呼叫 `SetGetGroupIdsFunction` 後會依群組清單合併共享組態檔，`ReloadConfiguration` 則重載所有設定，支援集中化下發的即時更新。【F:src/agent/configuration_parser/src/configuration_parser.cpp†L97-L158】【F:src/agent/src/agent.cpp†L55-L126】
+- 範本化的 `GetConfigOrDefault`、`GetConfigInRangeOrDefault` 與時間、容量解析函式提供型別安全與範圍檢查的查詢介面，讓其他模組能以預設值容錯。【F:src/agent/configuration_parser/include/configuration_parser.hpp†L45-L170】
+
+### Task Manager
+
+- 以 Boost.Asio 為核心，提供執行緒池啟動、單執行緒執行與安全停止機制，並追蹤排入的同步任務數量。【F:src/agent/task_manager/src/task_manager.cpp†L16-L123】【F:src/agent/task_manager/include/task_manager.hpp†L16-L63】
+- 支援 `awaitable` 協程排程與例外集中處理，亦能產生生命周期受控的定時器，方便長期背景任務使用。【F:src/agent/task_manager/src/task_manager.cpp†L125-L165】
+- `Agent::Run` 將認證、命令處理、訊息傳輸與 Instance Communicator 等協程託管給 Task Manager，成為代理運行期間的事件迴圈樞紐。【F:src/agent/src/agent.cpp†L134-L220】
 
 ```mermaid
 sequenceDiagram
