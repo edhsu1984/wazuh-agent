@@ -4,6 +4,34 @@ Wazuh Agent 採模組化設計，核心通訊、支援服務與功能模組三�
 
 ## 架構分層
 
+```mermaid
+graph TB
+    subgraph 功能模組層
+        module_manager["Module Manager"]
+        collectors["Collectors"]
+        executors["Executors"]
+    end
+    subgraph 支援層
+        config_parser["Configuration Parser"]
+        task_manager["Task Manager"]
+    end
+    subgraph 通訊層
+        communicator["Communicator"]
+        http2["HTTP/2 Client"]
+        mtq["MultiType Queue"]
+        command_handler["Command Handler"]
+    end
+
+    module_manager --> config_parser
+    collectors --> config_parser
+    executors --> task_manager
+    config_parser --> communicator
+    task_manager --> communicator
+    communicator --> http2
+    communicator --> mtq
+    mtq --> command_handler
+```
+
 | 層級 | 主要元件 | 職責重點 |
 | --- | --- | --- |
 | 通訊層 | Communicator、HTTP/2 Client、MultiType Queue、Command Handler | 與 Manager 進行認證、命令輪詢與事件上傳；MultiType Queue 提供持久化緩衝，Command Handler 處理下行命令並回報結果。【F:docs/ref/introduction/architecture.md†L52-L177】【F:src/agent/communicator/src/communicator.cpp†L94-L355】【F:src/agent/multitype_queue/src/multitype_queue.cpp†L17-L210】【F:src/agent/command_handler/src/command_handler.cpp†L67-L168】 |
@@ -11,6 +39,31 @@ Wazuh Agent 採模組化設計，核心通訊、支援服務與功能模組三�
 | 功能模組層 | Module Manager、Collectors、Executors | Module Manager 註冊並啟動模組；Collectors 產生事件、Executors 處理主動命令或反應作業。【F:docs/ref/introduction/architecture.md†L68-L76】【F:src/modules/src/moduleManager.cpp†L39-L171】【F:src/modules/logcollector/src/logcollector.cpp†L24-L169】【F:src/modules/active_response/src/execd.c†L415-L520】 |
 
 ## 主要資料流
+
+```mermaid
+flowchart LR
+    subgraph Agent
+        agent_start["Agent 啟動"]
+        communicator["Communicator"]
+        mtq["MultiType Queue"]
+        command_handler["Command Handler"]
+        modules["Collectors / 模組"]
+    end
+    subgraph Manager
+        manager["Wazuh Manager"]
+    end
+
+    agent_start --> communicator
+    communicator -->|認證請求| manager
+    manager -->|核發 token 與命令| communicator
+    communicator -->|命令排程| command_handler
+    modules -->|事件寫入| mtq
+    mtq -->|批次上傳| communicator
+    communicator -->|事件上傳| manager
+    command_handler -->|執行命令| modules
+    command_handler -->|結果寫回| mtq
+    communicator -->|命令結果回傳| manager
+```
 
 1. **認證與命令輪詢**：Agent 啟動後先發送認證請求，再透過 Communicator 的協程週期性輪詢命令、維持 token 與重新認證。【F:src/agent/src/agent.cpp†L134-L170】【F:src/agent/communicator/src/communicator.cpp†L102-L210】【F:src/agent/communicator/src/communicator.cpp†L295-L355】
 2. **事件上傳**：Collectors 與其他模組把資料寫入 MultiType Queue；Communicator 的 Stateful/Stateless 任務批次擷取事件並送往 Manager。【F:src/modules/src/moduleManager.cpp†L39-L151】【F:src/modules/logcollector/src/logcollector.cpp†L135-L160】【F:src/agent/src/agent.cpp†L147-L170】
