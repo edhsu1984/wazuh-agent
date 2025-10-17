@@ -4,7 +4,7 @@ Wazuh Agent 以模組化的方式拆分為核心通訊、任務排程與功能�
 
 ## 摘要
 
-- **核心通訊層**：HTTP/2 Client 維持與 Wazuh Manager 的長連線，透過 MultiType Queue 緩衝事件並以 Command Handler 解析下行命令。這三者構成 Agent 的資料平面。【F:docs/ref/introduction/architecture.md†L1-L80】【F:src/agent/src/agent.cpp†L134-L196】
+- **核心通訊層**：Communicator 負責排程認證、命令抓取與事件上傳協程，HTTP/2 Client 則維持與 Wazuh Manager 的長連線並執行請求；MultiType Queue 緩衝事件，Command Handler 解析下行命令，四者構成 Agent 的資料平面。【F:docs/ref/introduction/architecture.md†L1-L80】【F:src/agent/src/agent.cpp†L134-L206】【F:src/agent/communicator/src/communicator.cpp†L102-L421】
 - **支援服務層**：Configuration Parser 負責載入本地與集中化 YAML 組態；Task Manager 建立 Boost.Asio 執行緒池與協程排程，為所有背景工作提供生命週期管理。【F:docs/ref/introduction/architecture.md†L52-L76】【F:src/agent/configuration_parser/src/configuration_parser.cpp†L20-L158】【F:src/agent/task_manager/src/task_manager.cpp†L16-L165】
 - **功能模組層**：Collectors 負責日誌、檔案完整性與資產掃描；Executors 處理主動回應與升級等命令，並回寫 Queue 與 Manager 溝通。【F:docs/ref/introduction/architecture.md†L68-L76】【F:src/modules/src/moduleManager.cpp†L39-L172】
 
@@ -74,5 +74,6 @@ graph TD
 ## 延伸閱讀
 
 - [核心元件實作筆記](agent-core-core-components.md)
+- [Communicator 協程與重試流程](agent-core-core-components.md#communicator)
 - [功能模組與命令互動](functional-modules-collectors-executors.md)
 - [支援服務模組細節](support-services-module.md)
