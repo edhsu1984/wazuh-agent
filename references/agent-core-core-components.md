@@ -1,49 +1,30 @@
-# Wazuh Agent 核心元件深度解析
+# Wazuh Agent 核心元件實作筆記
 
-## 線上互動架構概觀
+本文件聚焦於 HTTP/2 Client、MultiType Queue 與 Command Handler 三個核心元件，說明它們的責任分工、關鍵 API 與彼此之間的資料流。
 
-Wazuh Agent 的核心由 HTTP/2 Client、MultiType Queue 與 Command Handler 共同組成，負責在本地模組與遠端 Wazuh Manager 之間維持可靠的資料交換。Client 透過 HTTP/2 與 Manager 建立持續連線並支援授權、逾時與錯誤處理；Queue 以 SQLite 為後端提供事件與命令的持久化佇列；Command Handler 則將 Manager 下發的命令序列化處理，並回報執行結果。這些元件協同運作的高階視圖如下：
+## 核心概念
 
-```mermaid
-flowchart LR
-    subgraph Manager[Wazuh Manager]
-        RemoteAPI[Agent Comm API]
-    end
+- **通訊路徑**：HTTP/2 Client 接收來自 `Agent::Run` 排程的協程請求，向 Manager 取命令並批次上送 Queue 中的事件資料。【F:src/agent/src/agent.cpp†L134-L188】【F:src/agent/http_client/src/http_client.cpp†L81-L181】
+- **持久化佇列**：MultiType Queue 透過 SQLite 儲存 STATELESS、STATEFUL 與 COMMAND 三類訊息，為重新啟動與批次傳輸提供緩衝。【F:src/agent/multitype_queue/include/multitype_queue.hpp†L25-L123】【F:src/agent/multitype_queue/src/multitype_queue.cpp†L17-L224】
+- **命令協調**：Command Handler 驗證命令格式、維護執行狀態並呼叫相對應的模組或系統處理程序。【F:src/agent/command_handler/src/command_handler.cpp†L37-L142】
 
-    subgraph AgentCore[Agent Core]
-        HttpClient[HTTP/2 Client]
-        Queue[MultiType Queue / SQLite]
-        CmdHandler[Command Handler]
-    end
+## 元件摘要
 
-    subgraph Modules[Agent Modules]
-        Collectors[Collectors]
-        Executors[Executors]
-    end
-
-    Collectors -- "推送事件" --> Queue
-    CmdHandler -- "寫入結果" --> Queue
-    Queue -- "批次事件" --> HttpClient
-    HttpClient -- "HTTP/2" --> RemoteAPI
-    RemoteAPI -- "命令" --> HttpClient
-    HttpClient -- "命令訊息" --> Queue
-    CmdHandler -- "從佇列擷取命令" --> Queue
-    CmdHandler -- "觸發" --> Executors
-```
-
-上圖與官方架構文件描述一致，強調核心元件透過 Queue 交換資料與指令，並仰賴 HTTP/2 連線與 SQLite 儲存維持可靠性。【F:docs/ref/introduction/architecture.md†L3-L77】
+| 元件 | 角色 | 重要資料結構 |
+| --- | --- | --- |
+| HTTP/2 Client | 提供同步/協程 HTTP 請求 API，負責解析主機、建立 TLS 連線與錯誤回復 | `HttpRequestParams`、`IHttpClient`【F:src/agent/http_client/include/http_request_params.hpp†L17-L65】【F:src/agent/http_client/include/ihttp_client.hpp†L13-L33】 |
+| MultiType Queue | 封裝基於 SQLite 的多型佇列，支援推送、批次擷取與背壓控制 | `Message`、`MultiTypeQueue`【F:src/agent/multitype_queue/include/message_entry/message.hpp†L7-L46】【F:src/agent/multitype_queue/include/multitype_queue.hpp†L25-L124】 |
+| Command Handler | 管理命令生命週期、持久化結果並在同步或非同步模式下分派命令 | `CommandHandler`、`VALID_COMMANDS_MAP`【F:src/agent/command_handler/src/command_handler.cpp†L20-L142】 |
 
 ## HTTP/2 Client
 
-### 核心責任
+### 職責
 
-* 建立解析器與 socket 實體，支援同步／非同步 HTTP/2 請求流程，確保與 Manager 的連線完整性。【F:src/agent/http_client/src/http_client.cpp†L81-L140】
-* 根據 `HttpRequestParams` 產生請求標頭，處理 Token 或 Basic 認證與 JSON 請求本文，支援內容類型與 chunked 傳輸設定。【F:src/agent/http_client/src/http_client.cpp†L32-L67】
-* 於非同步流程中設定 TLS 驗證與逾時策略，對錯誤進行例外處理並寫入日誌，回傳標準化的 `(status, body)` 結構。【F:src/agent/http_client/src/http_client.cpp†L127-L180】
+1. **組裝請求**：依 `HttpRequestParams` 產生標頭、權杖或 Basic 認證資料，必要時設定 JSON 本文與 chunked 傳輸。【F:src/agent/http_client/src/http_client.cpp†L32-L68】
+2. **建立連線**：透過 Resolver/Socket 工廠解析主機、設定 TLS 驗證與逾時，再以非同步或同步模式寫入與讀取資料。【F:src/agent/http_client/src/http_client.cpp†L103-L170】【F:src/agent/http_client/src/http_client.cpp†L183-L234】
+3. **錯誤控管**：捕捉連線與讀寫例外，統一回傳 500 狀態碼並寫入詳細日誌，避免將例外拋回呼叫端。【F:src/agent/http_client/src/http_client.cpp†L171-L180】
 
-`HttpRequestParams` 封裝了 HTTP 方法、伺服器資訊、驗證模式、使用者代理字串以及逾時設定，提供 Client 在建構請求時使用。【F:src/agent/http_client/include/http_request_params.hpp†L17-L60】Client 實作介面 `IHttpClient` 的同步與協程版本，讓呼叫端可在不同執行緒模型下重用同一流程。【F:src/agent/http_client/include/ihttp_client.hpp†L13-L33】
-
-### 流程
+### 協程流程
 
 ```mermaid
 sequenceDiagram
@@ -53,136 +34,75 @@ sequenceDiagram
     participant Socket as SocketFactory
     participant Manager as Wazuh Manager
 
-    Caller->>Client: PerformHttpRequest(params)
-    Client->>Resolver: Resolve Host/Port
-    Resolver-->>Client: Endpoints
-    Client->>Socket: Create + Connect
-    Socket-->>Client: TLS/逾時設定完成
-    Client->>Socket: Write HTTP/2 請求
-    Socket->>Manager: 傳送請求
+    Caller->>Client: Co_PerformHttpRequest(params)
+    Client->>Resolver: AsyncResolve(host, port)
+    Resolver-->>Client: endpoints
+    Client->>Socket: Create + Configure TLS/Timeout
+    Client->>Socket: AsyncConnect/Write
+    Socket->>Manager: HTTP/2 請求
     Manager-->>Socket: 回應資料
-    Socket-->>Client: Response
-    Client-->>Caller: (Status, Body)
+    Socket-->>Client: AsyncRead
+    Client-->>Caller: (status, body)
 ```
-
-非同步版本透過 `co_await` 與 Boost.Asio 定時器管理連線流程，同時於例外情境下統一回傳 500 狀態碼與錯誤訊息，避免呼叫端需要處理未預期的例外。【F:src/agent/http_client/src/http_client.cpp†L103-L180】
 
 ## MultiType Queue
 
-### 核心責任
+### 儲存模型
 
-* 針對 STATELESS、STATEFUL 與 COMMAND 三種訊息類型使用獨立表格，並限制每個類型的最大佇列長度以避免記憶體爆滿。【F:src/agent/multitype_queue/include/multitype_queue.hpp†L24-L44】【F:src/agent/multitype_queue/src/multitype_queue.cpp†L53-L105】
-* 透過 SQLite 持久化儲存，提供同步與協程版本的 `push`、`getNext`、`getNextBytes`、`pop` 操作，確保事件與命令在 Agent 重啟後仍可復原。【F:src/agent/multitype_queue/src/multitype_queue.cpp†L107-L224】【F:src/agent/multitype_queue/src/multitype_queue.cpp†L226-L333】
-* 使用條件變數與定時器控制批次大小與逾時，達成批次傳輸與背壓管理，並在達到批次門檻或逾時時傳回累積訊息。【F:src/agent/multitype_queue/src/multitype_queue.cpp†L188-L224】
+- 依 MessageType 映射至 `STATELESS`、`STATEFUL`、`COMMAND` 三張 SQLite 資料表，透過 `m_mapMessageTypeName` 取得對應表名。【F:src/agent/multitype_queue/include/multitype_queue.hpp†L32-L38】
+- Message 物件除 JSON 本文外還包含模組名稱、類型與 metadata，方便 Command Handler 與模組區分來源。【F:src/agent/multitype_queue/include/message_entry/message.hpp†L15-L46】
 
-Queue 依賴 `Storage` 類別對 SQLite 進行 CRUD，並透過 `ConfigurationParser` 取得批次間隔、佇列大小與資料路徑設定。【F:src/agent/multitype_queue/src/multitype_queue.cpp†L17-L48】【F:src/agent/multitype_queue/src/storage.hpp†L12-L55】訊息封裝在 `Message` 類別中，包含類型、模組名稱、模組類型與額外中繼資料。【F:src/agent/multitype_queue/include/message_entry/message.hpp†L7-L46】
+### 操作重點
 
-### 批次與持久化流程
+1. **推送**：`push` 會檢查佇列容量，必要時使用條件變數或協程定時器等待空間，再寫入 SQLite 並喚醒等待中的讀者。【F:src/agent/multitype_queue/src/multitype_queue.cpp†L53-L155】
+2. **批次取得**：`getNextBytesAwaitable` 依批次門檻或逾時回傳資料，同時記錄是否滿足預期大小以利日誌追蹤。【F:src/agent/multitype_queue/src/multitype_queue.cpp†L188-L224】
+3. **同步支援**：提供同步版 `getNext`、`pop` 與 `push(std::vector<Message>)`，方便非協程模組重用。【F:src/agent/multitype_queue/src/multitype_queue.cpp†L157-L333】
+
+### 批次傳輸示意
 
 ```mermaid
-flowchart TD
-    subgraph Producers[事件與命令產生者]
-        Collectors[Collectors 模組]
-        CmdLoader[Command Handler]
-    end
-    subgraph QueueCore[MultiType Queue]
-        Push[push/pushAwaitable]
-        Storage[(SQLite Storage)]
-        Batch[getNextBytesAwaitable]
-    end
-    subgraph Client[HTTP/2 Client]
-        Sender[批次送出]
-    end
+graph TD
+    producer[Modules / Command Handler]
+    queue[MultiType Queue]
+    storage[(SQLite Storage)]
+    client[HTTP/2 Client]
 
-    Collectors -->|MessageType.STATELESS| Push
-    CmdLoader -->|MessageType.COMMAND| Push
-    Push --> Storage
-    Batch --> Storage
-    Batch --> Sender
-    Sender -->|HTTP/2 傳送| Manager[Wazuh Manager]
-    Sender -.ack.-> Batch
+    producer -->|push| queue
+    queue --> storage
+    queue -->|getNextBytes| client
+    client -->|HTTP/2| Manager
+    client -.ack.-> queue
 ```
-
-此設計確保：
-
-1. 任何推送操作都會在 SQLite 中持久化，並在成功後喚醒等待的生產者或消費者。【F:src/agent/multitype_queue/src/multitype_queue.cpp†L61-L105】
-2. 消費端可依照所需 byte 數量或逾時取得批次資料，減少頻繁請求並提升傳輸效率。【F:src/agent/multitype_queue/src/multitype_queue.cpp†L188-L224】
-3. 透過 `isEmpty`、`isFull` 等查詢方法，Client 與 Command Handler 可以動態評估佇列狀態以調整處理節奏。【F:src/agent/multitype_queue/src/multitype_queue.cpp†L282-L333】
 
 ## Command Handler
 
-### 核心責任
+### 核心流程
 
-* 管理從 Queue 取出的命令，驗證參數與對應模組，並將命令落地到 SQLite 型的 `CommandStore` 以追蹤狀態。【F:src/agent/command_handler/src/command_handler.cpp†L67-L125】【F:src/agent/command_handler/src/command_store.hpp†L12-L52】
-* 支援同步與非同步命令；同步命令直接等待執行結果，非同步命令則透過 `co_spawn` 派生協程執行，避免阻塞命令流程。【F:src/agent/command_handler/src/command_handler.cpp†L121-L141】
-* 在啟動時清理未完成的命令，並於 Agent 停止時停止主循環，確保命令狀態與 Manager 保持一致。【F:src/agent/command_handler/src/command_handler.cpp†L79-L170】【F:src/agent/command_handler/src/command_handler.cpp†L209-L211】
+1. **啟動時清理**：代理重新啟動後，會掃描資料庫中仍為 `IN_PROGRESS` 的命令並更新狀態，避免重複執行。【F:src/agent/command_handler/src/command_handler.cpp†L79-L170】
+2. **命令驗證**：`CheckCommand` 依 `VALID_COMMANDS_MAP` 核對目標模組、執行模式與必要參數；不符合者立即回報失敗並自 Queue 移除。【F:src/agent/command_handler/src/command_handler.cpp†L20-L121】【F:src/agent/command_handler/src/command_handler.cpp†L172-L200】
+3. **執行與回報**：同步命令會直接等待結果；非同步命令以 `co_spawn` 啟動協程，完成後更新 Command Store 並透過回呼回寫 Queue。【F:src/agent/command_handler/src/command_handler.cpp†L121-L141】
 
-命令定義使用 `CommandEntry` 封裝命令識別、模組、參數、執行模式與結果狀態，並透過常數定義受支援的命令與模組名稱。【F:src/agent/command_handler/include/command_entry/command_entry.hpp†L9-L110】`CheckCommand` 會依據允許命令清單驗證參數型別與額外欄位，避免執行未授權操作。【F:src/agent/command_handler/src/command_handler.cpp†L172-L205】
-
-### 命令處理流程
+### 與其他元件的互動
 
 ```mermaid
 sequenceDiagram
-    participant Queue as MultiType Queue
-    participant Handler as Command Handler
-    participant Store as CommandStore(SQLite)
-    participant Executor as 對應模組
     participant Manager as Wazuh Manager
+    participant Client as HTTP/2 Client
+    participant Queue as MultiType Queue
+    participant Cmd as Command Handler
+    participant Module as Modules/Services
 
-    Manager->>Queue: COMMAND 訊息
-    Handler->>Queue: getCommandFromQueue()
-    Queue-->>Handler: CommandEntry
-    Handler->>Handler: CheckCommand()
-    alt 驗證失敗
-        Handler->>Queue: popCommandFromQueue()
-        Handler->>Manager: 報告失敗
-    else 驗證成功
-        Handler->>Store: StoreCommand()
-        Handler->>Queue: popCommandFromQueue()
-        Handler->>Executor: dispatchCommand()
-        Executor-->>Handler: ExecutionResult
-        Handler->>Store: UpdateCommand()
-        Handler->>Manager: reportCommandResult()
-    end
+    Manager->>Client: 下發命令
+    Client->>Queue: push COMMAND
+    Cmd->>Queue: getNext COMMAND
+    Cmd->>Module: Dispatch (sync/async)
+    Module-->>Cmd: ExecutionResult
+    Cmd->>Queue: push 結果
+    Queue->>Client: getNext STATEFUL/STATELESS
+    Client->>Manager: 上傳批次
 ```
 
-若 Agent 在命令執行期間重啟，Command Handler 會於啟動時將狀態為 `IN_PROGRESS` 的命令更新成失敗或成功（針對 restart 命令），並同步回報，避免命令永遠卡住。【F:src/agent/command_handler/src/command_handler.cpp†L145-L170】
+## 整體協同
 
-## 整體資料流摘要
+當 Agent 啟動時，Task Manager 會同時排程 HTTP/2 通訊、Queue 批次傳輸與命令處理協程；MultiType Queue 則作為資料交會點，確保模組推送的事件與命令回報在 Agent 重啟或網路不穩定時不會遺失。【F:src/agent/src/agent.cpp†L134-L196】【F:src/agent/multitype_queue/src/multitype_queue.cpp†L17-L224】
 
-```mermaid
-flowchart TD
-    subgraph Manager[Wazuh Manager]
-        CmdAPI[命令/事件 API]
-    end
-
-    subgraph Agent[Wazuh Agent]
-        subgraph Modules[Collectors/Executors]
-            Collectors
-            Executors
-        end
-        subgraph Queue[MultiType Queue + SQLite]
-            Persist[Store / Retrieve]
-        end
-        subgraph Core[核心協程]
-            Client[HTTP/2 Client]
-            Handler[Command Handler]
-        end
-    end
-
-    Collectors -- "事件訊息" --> Persist
-    Executors -- "回傳結果" --> Persist
-    CmdAPI -- "命令" --> Client
-    Client -- "寫入 COMMAND" --> Persist
-    Handler -- "讀取/刪除 COMMAND" --> Persist
-    Handler -- "呼叫模組" --> Executors
-    Client -- "讀取 STATELESS/STATEFUL" --> Persist
-    Client -- "HTTP/2 上傳" --> CmdAPI
-    Handler -- "回報結果" --> Client
-```
-
-此資料流展示：
-
-1. 事件先進入 MultiType Queue，再由 Client 批次傳送至 Manager，確保傳輸時序與可靠性。【F:src/agent/multitype_queue/src/multitype_queue.cpp†L226-L248】
-2. Manager 下發命令後由 Client 轉寫至 Queue，Command Handler 負責擷取與執行，並透過 CommandStore 追蹤狀態。【F:src/agent/command_handler/src/command_handler.cpp†L67-L141】
-3. 所有命令與事件皆在 SQLite 中持久化，支援 Agent 重啟後的恢復能力，符合官方架構文件對可靠傳輸的要求。【F:src/agent/multitype_queue/src/storage.hpp†L12-L55】【F:docs/ref/introduction/architecture.md†L63-L77】
