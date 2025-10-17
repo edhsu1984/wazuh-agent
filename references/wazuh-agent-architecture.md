@@ -9,7 +9,8 @@ Wazuh Agent 透過清楚分工的元件協作，達成安全事件的蒐集、�
 - **Agent 核心**：包含 HTTP/2 Client、Queue 及 Command Handler。Client 透過 Boost.Asio 建立 HTTP/2 連線並處理認證與逾時；Queue 以 SQLite 保存事件與命令；Command Handler 負責驗證與執行命令並回寫結果。【F:docs/ref/introduction/architecture.md†L5-L44】【F:src/agent/http_client/src/http_client.cpp†L103-L180】【F:src/agent/multitype_queue/src/multitype_queue.cpp†L53-L224】【F:src/agent/command_handler/src/command_handler.cpp†L67-L170】
 - **Configuration Parser**：自 YAML 檔案或字串載入設定，提供其他模組查詢配置的能力。【F:docs/ref/introduction/architecture.md†L5-L32】
 - **Task Manager**：建立與管理執行緒，安排模組化工作的排程與生命週期。【F:docs/ref/introduction/architecture.md†L5-L32】
-- **Modules**：分為 Collectors 與 Executors。Collectors 進行日誌、檔案完整性、資安基線與資產清查等資料蒐集；Executors 處理升級、集中化配置與主動回應等操作。【F:docs/ref/introduction/architecture.md†L33-L44】
+- **Modules**：分為 Collectors 與 Executors。Collectors 進行日誌、檔案完整性、資安基線與資產清查等資料蒐集；Executors 處理升級、集中化配置與主動回應等操作；更多任務拆解可參考《[功能模組（Collectors / Executors）深度解析](functional-modules-collectors-executors.md)》。
+【F:docs/ref/introduction/architecture.md†L33-L44】
 - **Dependencies**：SQLite 提供 Queue 與 Command Handler 的持久化儲存；HTTP Client 供 Client 建立安全連線。【F:docs/ref/introduction/architecture.md†L24-L32】
 - **Server/Manager**：在伺服端接收 Agent 上傳的事件並發送遠端命令，是整體協調中心。【F:docs/ref/introduction/architecture.md†L5-L44】
 
@@ -55,6 +56,12 @@ graph TD
 2. **資料蒐集**：Collectors（例如 Logcollector、FIM、SCA 與 Inventory）依排程或事件觸發蒐集資訊，並透過 Queue 推送事件資料。【F:docs/ref/introduction/architecture.md†L33-L44】
 3. **命令執行與回饋**：Wazuh Manager 可下發指令，由 Client 取回並交給 Command Handler 執行；Command Handler 驗證命令、寫入命令資料庫並觸發對應模組，執行結果再透過 Queue 回送。Executors 亦在此階段處理升級、主動回應等操作。【F:docs/ref/introduction/architecture.md†L5-L44】【F:src/agent/command_handler/src/command_handler.cpp†L67-L141】
 4. **事件傳送**：Client 從 Queue 取出事件與命令結果，透過 HTTP/2 與 Manager 交換資料，Queue 以 SQLite 確保傳送前後的資料一致與持久化。【F:docs/ref/introduction/architecture.md†L5-L44】
+
+## 功能模組互動重點
+
+- **啟動與排程**：`ModuleManager` 在初始化時會將 Logcollector、FIM、Inventory、SCA 等 Collectors 與 Active Response、Agent Upgrade 等 Executors 註冊到 Task Manager，並統一注入訊息推播函式與設定解析器。【F:src/modules/src/moduleManager.cpp†L39-L160】
+- **資料路徑**：Collectors 經由 MultiType Queue 發佈事件，Executors 在命令執行後回寫結果；兩者都透過 HTTP/2 Client 與 Command Handler 與 Manager 互動，其細節可參考延伸閱讀的架構與流程圖。【F:references/functional-modules-collectors-executors.md†L5-L112】
+
 
 ## 支援服務模組詳解
 
